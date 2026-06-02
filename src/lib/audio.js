@@ -133,6 +133,47 @@ export function splitScriptToTimedSegments(scriptText, videoDuration) {
   return segments;
 }
 
+// ─── Split recap into N equal-time segments spanning full duration ──────────
+// Splits the script text into N pieces by character length, but assigns each
+// piece an EQUAL slice of the video duration (videoDuration / N).
+export function splitScriptToEqualTimeSegments(scriptText, videoDuration, N) {
+  const clean = (scriptText || '').replace(/\s+/g, ' ').trim();
+  if (!clean || !videoDuration || N < 1) return [];
+  N = Math.max(1, Math.floor(N));
+
+  // Prefer splitting at Myanmar sentence boundaries (။) then spaces.
+  const sentences = clean.split(/(?<=။)\s*/).filter(Boolean);
+
+  // Greedy-pack sentences into N buckets of roughly equal char length.
+  const target = clean.length / N;
+  const buckets = Array.from({ length: N }, () => '');
+  let bi = 0;
+  for (const s of sentences) {
+    if (bi < N - 1 && buckets[bi].length + s.length > target * 1.15 && buckets[bi].length > 0) bi++;
+    buckets[bi] += (buckets[bi] ? ' ' : '') + s;
+  }
+  // If buckets at the tail are empty (few sentences), redistribute by char slicing.
+  const empty = buckets.filter(b => !b).length;
+  if (empty > 0) {
+    const sliceLen = Math.ceil(clean.length / N);
+    for (let i = 0; i < N; i++) {
+      buckets[i] = clean.slice(i * sliceLen, (i + 1) * sliceLen).trim();
+    }
+  }
+
+  const slice = videoDuration / N;
+  return buckets.map((text, i) => ({
+    id: `recap-eq-${i}`,
+    start: parseFloat((i * slice).toFixed(2)),
+    end:   parseFloat(((i + 1) * slice).toFixed(2)),
+    sourceText: text,
+    myanmarText: text,
+    audioUrl: null,
+    dubSpeed: 1.0,
+    isGeneratingTTS: false,
+  }));
+}
+
 // ─── Gemini TTS ──────────────────────────────────────────────────────────────
 export async function requestGeminiTts(text, voice, emotion, apiKey) {
   if (!apiKey) throw new Error('API Key missing.');
@@ -300,6 +341,100 @@ export async function renderOutputVideo(videoEl, segments, onProgress) {
   });
 }
 
+// ─── Render output with TTS audio track instead of original audio ───────────
+// Mixes one long-form Burmese TTS audio (recapAudioUrl) over the silent video,
+// burns in the subtitle segments, and exports a webm via MediaRecorder.
+export async function renderOutputVideoWithTts(videoEl, segments, recapAudioUrl, onProgress) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width  = videoEl.videoWidth  || 1280;
+      canvas.height = videoEl.videoHeight || 720;
+      const ctx = canvas.getContext('2d');
+
+      // Video stream from canvas
+      const videoStream = canvas.captureStream(30);
+
+      // Audio: TTS via Web Audio API → MediaStreamDestination
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ac = new AC();
+      const dest = ac.createMediaStreamDestination();
+      const ttsAudio = new Audio();
+      ttsAudio.crossOrigin = 'anonymous';
+      ttsAudio.src = recapAudioUrl;
+      await new Promise((r, j) => { ttsAudio.onloadedmetadata = r; ttsAudio.onerror = j; });
+      const ttsSrc = ac.createMediaElementSource(ttsAudio);
+      ttsSrc.connect(dest);
+      ttsSrc.connect(ac.destination); // also audible while rendering (optional)
+
+      const tracks = [...videoStream.getTracks(), ...dest.stream.getAudioTracks()];
+      const combined = new MediaStream(tracks);
+
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+        ? 'video/webm;codecs=vp9,opus'
+        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
+        ? 'video/webm;codecs=vp8,opus'
+        : 'video/webm';
+      const recorder = new MediaRecorder(combined, { mimeType, videoBitsPerSecond: 4_000_000 });
+      const chunks = [];
+      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.onstop = () => resolve(URL.createObjectURL(new Blob(chunks, { type: mimeType })));
+      recorder.onerror = reject;
+
+      const FONT_SIZE = Math.round(canvas.height * 0.048);
+      const PAD = 16, LINE_H = FONT_SIZE * 1.45, BOX_R = 10;
+      function rr(x, y, w, h, r) {
+        ctx.beginPath();
+        ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+        ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+        ctx.lineTo(x+r,y+h); ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+        ctx.lineTo(x,y+r); ctx.quadraticCurveTo(x,y,x+r,y); ctx.closePath();
+      }
+      function drawSub(text) {
+        if (!text) return;
+        ctx.save();
+        ctx.font = `700 ${FONT_SIZE}px "Noto Sans Myanmar","Padauk",sans-serif`;
+        ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+        const maxW = canvas.width * 0.82;
+        const words = text.split(' '); const lines = []; let cur = '';
+        for (const w of words) {
+          const test = cur ? cur+' '+w : w;
+          if (ctx.measureText(test).width > maxW && cur) { lines.push(cur); cur = w; }
+          else cur = test;
+        }
+        if (cur) lines.push(cur);
+        const totalH = lines.length * LINE_H + PAD * 2;
+        const boxY = canvas.height - totalH - FONT_SIZE * 0.6;
+        const boxW = Math.min(maxW + PAD * 3, canvas.width - 40);
+        const boxX = (canvas.width - boxW) / 2;
+        ctx.fillStyle = 'rgba(0,0,0,0.72)'; rr(boxX, boxY, boxW, totalH, BOX_R); ctx.fill();
+        ctx.shadowColor = 'rgba(0,0,0,0.95)'; ctx.shadowBlur = 8; ctx.fillStyle = '#fff';
+        lines.forEach((ln, li) => ctx.fillText(ln, canvas.width/2, boxY + PAD + (li+1)*LINE_H));
+        ctx.restore();
+      }
+
+      const duration = videoEl.duration;
+      videoEl.muted = true; // mute original audio — TTS replaces it
+      videoEl.currentTime = 0; videoEl.playbackRate = 1;
+      ttsAudio.currentTime = 0;
+      let rafId;
+      recorder.start(100);
+      const tick = () => {
+        const t = videoEl.currentTime;
+        ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+        const active = segments.find(s => t >= s.start && t < s.end);
+        if (active) drawSub(active.myanmarText);
+        if (onProgress) onProgress(Math.min(1, t / duration));
+        if (t < duration && !videoEl.paused) rafId = requestAnimationFrame(tick);
+        else { cancelAnimationFrame(rafId); try{ ttsAudio.pause(); }catch{} recorder.stop(); videoEl.pause(); }
+      };
+      await Promise.all([videoEl.play(), ttsAudio.play()]);
+      rafId = requestAnimationFrame(tick);
+    } catch (e) { reject(e); }
+  });
+}
+
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 export const DEMO_SEGMENTS = [
   {id:'seg-1',start:2.5,end:8.0,sourceText:'Deep inside the dark forest, a mysterious glowing door appeared before him.',myanmarText:'မှောင်မိုက်လှတဲ့ သစ်တောနက်ကြီးထဲမှာ၊ ဆန်းကြယ်တဲ့ အလင်းတံခါးတစ်ခုက သူ့ရှေ့မှာ ပေါ်လာခဲ့ပါတယ်။',audioUrl:null,dubSpeed:1.0,isGeneratingTTS:false},
@@ -314,14 +449,25 @@ export const DEMO_RECAP = `မိတ်ဆက် — မင်္ဂလာပါ
 
 နိဂုံး — သူဟာ ဒီ အနာဂတ်ကမ္ဘာကနေ ပြန်လွတ်မြောက်နိုင်ပါ့မလား? နောက်အပိုင်းမှာ ဆက်လက် ကြည့်ရှုပေးကြပါဦးနော်။`;
 
-export const VOICES = {
-  male:[{value:'Kore',label:'Kore — Recap Host'},{value:'Fenrir',label:'Fenrir — Dramatic'},{value:'Puck',label:'Puck — Versatile'}],
-  female:[{value:'Leda',label:'Leda — Storyteller'},{value:'Zephyr',label:'Zephyr — Soft'},{value:'Aoede',label:'Aoede — Melodic'}]
-};
-export const EMOTIONS=[
-  {value:'excitedly',label:'Excited'},
-  {value:'calmly',label:'Calm / Serious'},
-  {value:'cheerfully',label:'Upbeat'},
-  {value:'in a whisper',label:'Whisper'},
-  {value:'dramatically',label:'Dramatic'},
+// Voices grouped flat with gender + descriptor (matches Voice picker UI).
+export const VOICES = [
+  { value:'Kore',   gender:'Female', descriptor:'Warm' },
+  { value:'Aoede',  gender:'Female', descriptor:'Bright' },
+  { value:'Leda',   gender:'Female', descriptor:'Smooth' },
+  { value:'Charon', gender:'Male',   descriptor:'Deep' },
+  { value:'Fenrir', gender:'Male',   descriptor:'Grounded' },
+  { value:'Orus',   gender:'Male',   descriptor:'Rich' },
+  { value:'Puck',   gender:'Male',   descriptor:'Expressive' },
 ];
+
+// Audio styles, mapped to a Gemini-TTS prompt directive.
+export const EMOTIONS = [
+  { value:'in a normal, clear, natural tone',           label:'Normal',      hint:'Clear, natural delivery' },
+  { value:'excitedly with high energy and enthusiasm',  label:'Excited',     hint:'High energy, enthusiastic' },
+  { value:'in a quiet, intimate whisper',               label:'Whisper',     hint:'Quiet, intimate tone' },
+  { value:'as a formal, authoritative news anchor',     label:'News Anchor', hint:'Formal, authoritative' },
+  { value:'in a soft, peaceful, gentle tone',           label:'Calm',        hint:'Soft, peaceful, gentle' },
+  { value:'cheerfully, warm and bright and positive',   label:'Cheerful',    hint:'Warm, bright, positive' },
+  { value:'in a melancholic, somber, emotional tone',   label:'Somber',      hint:'Melancholic, emotional' },
+];
+
