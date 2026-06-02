@@ -2,10 +2,11 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import Head from 'next/head';
 import {
   audioBufferChunkToBase64, transcribeChunkWithGemini,
-  generateRecapWithGemini, splitScriptToTimedSegments,
-  requestGeminiTts, drawWaveform, buildSrt, renderOutputVideo,
+  generateRecapWithGemini, splitScriptToTimedSegments, splitScriptToEqualTimeSegments,
+  requestGeminiTts, drawWaveform, buildSrt, renderOutputVideo, renderOutputVideoWithTts,
   DEMO_SEGMENTS, DEMO_RECAP, VOICES, EMOTIONS, sleep
 } from '../lib/audio';
+
 
 // ─── Tiny icons ──────────────────────────────────────────────────────────────
 const Icon = ({ d, cls='w-4 h-4' }) => (
@@ -141,8 +142,16 @@ export default function App() {
   // ── Recap script ────────────────────────────────────────────────────────
   const [recapScript, setRecapScript] = useState('');
   const [isGenRecap, setIsGenRecap] = useState(false);
-  const [recapVoice, setRecapVoice] = useState('Kore');
-  const [recapEmotion, setRecapEmotion] = useState('excitedly');
+  const [recapVoice, setRecapVoice] = useState('Leda');
+  const [recapEmotion, setRecapEmotion] = useState(EMOTIONS[0].value);
+
+  // ── Recap TTS (long-form Burmese narration over full video) ─────────────
+  const [recapTtsUrl, setRecapTtsUrl] = useState(null);
+  const [isGenRecapTts, setIsGenRecapTts] = useState(false);
+  const [segmentCount, setSegmentCount] = useState(12); // N equal-time subs
+  const [splitMode, setSplitMode]   = useState('equal'); // 'equal' | 'proportional'
+  const [useTtsTrack, setUseTtsTrack] = useState(true);
+
 
   // ── Output video ────────────────────────────────────────────────────────
   const [isRendering, setIsRendering] = useState(false);
@@ -295,8 +304,11 @@ export default function App() {
         script = await generateRecapWithGemini(segments, duration, apiKey);
       }
       setRecapScript(script);
-      // Auto-split and sync
-      const recapSegs = splitScriptToTimedSegments(script, duration);
+      setRecapTtsUrl(null); // invalidate old TTS — script changed
+      // Auto-split and sync (equal-time spans the FULL video duration)
+      const recapSegs = splitMode === 'equal'
+        ? splitScriptToEqualTimeSegments(script, duration, segmentCount)
+        : splitScriptToTimedSegments(script, duration);
       setSegments(recapSegs);
       setSubtitleMode('recap');
       setStep(4);
@@ -313,10 +325,52 @@ export default function App() {
   // ─────────────────────────────────────────────────────────────────────────
   const resyncSegments = () => {
     if (!recapScript || !duration) { err('Generate a recap script first.'); return; }
-    const segs = splitScriptToTimedSegments(recapScript, duration);
+    const segs = splitMode === 'equal'
+      ? splitScriptToEqualTimeSegments(recapScript, duration, segmentCount)
+      : splitScriptToTimedSegments(recapScript, duration);
     setSegments(segs);
-    ok(`Re-synced ${segs.length} subtitle segments across ${duration.toFixed(0)}s.`);
+    setRecapTtsUrl(null);
+    ok(`Re-synced ${segs.length} subtitle segments across ${duration.toFixed(0)}s (${splitMode}).`);
   };
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Download recap script as .txt
+  // ─────────────────────────────────────────────────────────────────────────
+  const downloadRecapTxt = () => {
+    if (!recapScript) { err('No recap script yet.'); return; }
+    const blob = new Blob([recapScript], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'recap-script.txt'; a.click();
+    URL.revokeObjectURL(url);
+    ok('Recap script downloaded.');
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Generate long-form Burmese TTS for the full recap script
+  // ─────────────────────────────────────────────────────────────────────────
+  const runGenerateRecapTts = async () => {
+    if (!recapScript) { err('Generate a recap script first.'); return; }
+    if (!demoMode && !apiKey) { err('Enter your Gemini API key first.'); return; }
+    setIsGenRecapTts(true);
+    try {
+      let url;
+      if (demoMode || !apiKey) {
+        // Demo: synthesize the first segment locally as a stand-in
+        await sleep(800);
+        url = 'demo://recap';
+      } else {
+        url = await requestGeminiTts(recapScript, recapVoice, recapEmotion, apiKey);
+      }
+      setRecapTtsUrl(url);
+      ok(`Recap TTS generated · ${recapVoice} · ${EMOTIONS.find(e=>e.value===recapEmotion)?.label}`);
+    } catch(ex) {
+      err(`Recap TTS failed: ${ex.message}`);
+    } finally {
+      setIsGenRecapTts(false);
+    }
+  };
+
 
   // ─────────────────────────────────────────────────────────────────────────
   // Per-segment TTS
@@ -376,9 +430,14 @@ export default function App() {
     setRenderProgress(0);
     setStep(5);
     try {
-      const url = await renderOutputVideo(videoRef.current, segments, p => setRenderProgress(p));
+      const url = (useTtsTrack && recapTtsUrl && !recapTtsUrl.startsWith('demo'))
+        ? await renderOutputVideoWithTts(videoRef.current, segments, recapTtsUrl, p => setRenderProgress(p))
+        : await renderOutputVideo(videoRef.current, segments, p => setRenderProgress(p));
       setOutputUrl(url);
-      ok('Output video rendered with burned-in Myanmar subtitles!');
+      ok(useTtsTrack && recapTtsUrl
+        ? 'Output video rendered with Burmese TTS audio + burned-in subtitles!'
+        : 'Output video rendered with burned-in Myanmar subtitles!');
+
     } catch(ex) {
       err(`Render failed: ${ex.message}`);
     } finally {
@@ -624,7 +683,8 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <select value={recapVoice} onChange={e=>setRecapVoice(e.target.value)}
                     className="input-premium bg-slate-950 rounded-lg px-2 py-1.5 text-[10px] text-slate-300">
-                    {[...VOICES.male,...VOICES.female].map(v=><option key={v.value} value={v.value}>{v.label}</option>)}
+                    {VOICES.map(v=><option key={v.value} value={v.value}>{v.value} · {v.gender} · {v.descriptor}</option>)}
+
                   </select>
                   <select value={recapEmotion} onChange={e=>setRecapEmotion(e.target.value)}
                     className="input-premium bg-slate-950 rounded-lg px-2 py-1.5 text-[10px] text-slate-300">
@@ -719,8 +779,109 @@ export default function App() {
                   : '🎭 Generate AI Recap Script + Auto-Sync to Video'}
               </button>
             </div>
+
+            {/* ════════════════════════════════════════════════════════════
+                HUB 2b · RECAP TTS STUDIO (post-script generation)
+                Voice + Audio Style picker · Equal-time subtitle splitter ·
+                Long-form Burmese TTS · Download .txt · Render with TTS
+            ════════════════════════════════════════════════════════════ */}
+            <div className="studio-panel p-4 flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span className="text-[9px] font-bold uppercase tracking-widest text-amber-400">Hub 2b · Recap TTS Studio</span>
+                  <h2 className="text-sm font-bold text-slate-100 mt-0.5">Burmese Narration · Voice & Style</h2>
+                  <p className="text-[10px] text-slate-500">Pick a voice, generate the full TTS, sync N equal-time subtitles, then render.</p>
+                </div>
+                <button onClick={downloadRecapTxt} disabled={!recapScript}
+                  className="flex items-center gap-1.5 text-[10px] bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 border border-slate-700 px-2.5 py-1.5 rounded-lg font-bold transition-all">
+                  <Icon d={ICO_DL} cls="w-3 h-3"/> Script .txt
+                </button>
+              </div>
+
+              {/* AUDIO STYLE */}
+              <div className="flex flex-col gap-1">
+                <label className="text-[9px] font-bold uppercase tracking-widest text-amber-400/80">Audio Style</label>
+                <select value={recapEmotion} onChange={e=>setRecapEmotion(e.target.value)}
+                  className="input-premium bg-slate-950 border border-amber-500/20 rounded-lg px-3 py-2.5 text-xs text-slate-200">
+                  {EMOTIONS.map(e=>(
+                    <option key={e.value} value={e.value}>{e.label} — {e.hint}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* VOICE */}
+              <div className="flex flex-col gap-1">
+                <label className="text-[9px] font-bold uppercase tracking-widest text-amber-400/80">Voice</label>
+                <select value={recapVoice} onChange={e=>setRecapVoice(e.target.value)}
+                  className="input-premium bg-slate-950 border border-amber-500/20 rounded-lg px-3 py-2.5 text-xs text-slate-200">
+                  {VOICES.map(v=>(
+                    <option key={v.value} value={v.value}>{v.value} · {v.gender} · {v.descriptor}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* SUBTITLE SPLIT CONTROLS */}
+              <div className="flex flex-col gap-1.5 pt-1">
+                <div className="flex items-center justify-between">
+                  <label className="text-[9px] font-bold uppercase tracking-widest text-cyan-400/80">Subtitle Segments</label>
+                  <span className="text-[10px] font-mono text-cyan-300">{splitMode==='equal' ? `${segmentCount} × ${duration ? (duration/segmentCount).toFixed(2) : '0'}s` : 'proportional'}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <select value={splitMode} onChange={e=>setSplitMode(e.target.value)}
+                    className="input-premium bg-slate-950 border border-cyan-500/20 rounded-lg px-2 py-1.5 text-[10px] text-slate-200">
+                    <option value="equal">Equal-time (N spans)</option>
+                    <option value="proportional">Proportional (by length)</option>
+                  </select>
+                  <input type="range" min={2} max={40} step={1} value={segmentCount}
+                    onChange={e=>setSegmentCount(parseInt(e.target.value,10))}
+                    disabled={splitMode!=='equal'}
+                    className="flex-1 accent-cyan-500"/>
+                  <span className="text-[10px] font-mono text-slate-400 w-6 text-right">{segmentCount}</span>
+                </div>
+                <button onClick={resyncSegments} disabled={!recapScript || !duration}
+                  className="text-[10px] bg-cyan-600/15 hover:bg-cyan-600/25 disabled:opacity-40 text-cyan-200 border border-cyan-500/25 px-2.5 py-1.5 rounded-lg font-bold transition-all flex items-center justify-center gap-1.5">
+                  <Icon d={ICO_SYNC} cls="w-3 h-3"/> Re-sync subtitles to timeline
+                </button>
+              </div>
+
+              {/* GENERATE TTS */}
+              <button onClick={runGenerateRecapTts} disabled={isGenRecapTts || !recapScript}
+                className="btn-premium w-full py-3 rounded-xl text-xs font-black tracking-wide flex items-center justify-center gap-2"
+                style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)' }}>
+                {isGenRecapTts
+                  ? <><Spin c='amber'/>Synthesizing Burmese narration…</>
+                  : (recapTtsUrl ? '♪ Re-generate Burmese TTS' : '🎙️ Generate Full Burmese TTS')}
+              </button>
+
+              {/* TTS PLAYER */}
+              {recapTtsUrl && !recapTtsUrl.startsWith('demo') && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-950/10 p-3 flex flex-col gap-2">
+                  <div className="flex items-center justify-between text-[10px]">
+                    <span className="font-bold text-amber-300">▶ Recap audio preview</span>
+                    <a href={recapTtsUrl} download="recap-tts.wav"
+                      className="flex items-center gap-1 text-amber-400 hover:text-amber-200">
+                      <Icon d={ICO_DL} cls="w-3 h-3"/> .wav
+                    </a>
+                  </div>
+                  <audio src={recapTtsUrl} controls className="w-full" style={{ height: 32 }}/>
+                </div>
+              )}
+              {recapTtsUrl && recapTtsUrl.startsWith('demo') && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-950/20 p-3 text-[10px] text-amber-300">
+                  Demo mode — switch to Live API and paste your Gemini key to hear real Burmese TTS.
+                </div>
+              )}
+
+              {/* MIX-IN TOGGLE */}
+              <label className="flex items-center gap-2 text-[10px] text-slate-400 cursor-pointer select-none">
+                <input type="checkbox" checked={useTtsTrack} onChange={e=>setUseTtsTrack(e.target.checked)}
+                  className="accent-amber-500"/>
+                Use Burmese TTS as the audio track when rendering the final video
+              </label>
+            </div>
           </div>
         </main>
+
 
         {/* ── FOOTER ───────────────────────────────────────────────── */}
         <footer className="border-t border-violet-500/10 bg-slate-950/60 px-5 py-2.5 flex flex-wrap items-center justify-between text-[9px] text-slate-600 gap-2">
