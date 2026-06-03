@@ -46,12 +46,12 @@ function PBar({ v, color = 'violet' }) {
 
 // ─── Step pill ────────────────────────────────────────────────────────────────
 const STEPS = [
-  { n:1, label:'Upload',     ico: I.upload },
-  { n:2, label:'Transcribe', ico: I.mic    },
-  { n:3, label:'Recap',      ico: I.script },
-  { n:4, label:'TTS',        ico: I.tts    },
-  { n:5, label:'TTS Sync',   ico: I.sync   },
-  { n:6, label:'Export',     ico: I.video  },
+  { n:1, label:'Upload',    ico: I.upload },
+  { n:2, label:'Transcribe',ico: I.mic    },
+  { n:3, label:'Recap',     ico: I.script },
+  { n:4, label:'TTS',       ico: I.tts    },
+  { n:5, label:'Sync',      ico: I.sync   },
+  { n:6, label:'⬇ Export',  ico: I.dl     },
 ];
 function StepBar({ current }) {
   return (
@@ -160,11 +160,8 @@ export default function App() {
   // ── step 5: tts sync ─────────────────────────────────────────────────────
   const [isSynced,      setIsSynced]      = useState(false);
 
-  // ── step 6: render ───────────────────────────────────────────────────────
-  const [isRendering,   setIsRendering]   = useState(false);
-  const [renderProg,    setRenderProg]    = useState(0);
-  const [outputUrl,     setOutputUrl]     = useState(null);
-  const [outputMime,    setOutputMime]    = useState('video/webm');
+  // ── step 6: export ───────────────────────────────────────────────────────
+  // (no render state needed — exports are direct downloads)
 
   // ── refs ─────────────────────────────────────────────────────────────────
   const videoRef  = useRef(null);
@@ -347,28 +344,81 @@ export default function App() {
   };
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // STEP 6 — Export SRT + Render Output Video
+  // EXPORT — Merge all TTS clips into one full-length WAV (silence-padded)
+  // Each clip placed at its synced start time — ready to merge with original video
   // ═══════════════════════════════════════════════════════════════════════════
-  const exportSrt = () => {
+  const [isMergingAudio, setIsMergingAudio] = useState(false);
+  const [mergedAudioUrl, setMergedAudioUrl] = useState(null);
+
+  const exportMergedTtsAudio = async () => {
+    const validSegs = segments.filter(s => s.ttsUrl && s.ttsUrl !== 'demo');
+    if (!validSegs.length) { showErr('No TTS audio synthesized yet. Run Batch TTS first.'); return; }
+    if (!duration) { showErr('Video duration unknown.'); return; }
+    setIsMergingAudio(true);
+    try {
+      const SAMPLE_RATE = 24000;
+      const totalSamples = Math.ceil(duration * SAMPLE_RATE);
+      const output = new Float32Array(totalSamples); // silence canvas
+
+      for (const seg of validSegs) {
+        // Fetch and decode each TTS wav blob URL
+        const resp = await fetch(seg.ttsUrl);
+        const arrayBuf = await resp.arrayBuffer();
+        const actx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+        const decoded = await actx.decodeAudioData(arrayBuf);
+        const ch = decoded.getChannelData(0);
+        const startSample = Math.floor(seg.start * SAMPLE_RATE);
+        // Write TTS clip at correct timestamp position
+        for (let i = 0; i < ch.length; i++) {
+          const pos = startSample + i;
+          if (pos < totalSamples) output[pos] += ch[i];
+        }
+        await actx.close();
+      }
+
+      // Encode Float32 → 16-bit PCM WAV
+      const pcm = new Int16Array(totalSamples);
+      for (let i = 0; i < totalSamples; i++) {
+        const s = Math.max(-1, Math.min(1, output[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      // Build WAV header
+      const wavBuf = new ArrayBuffer(44 + pcm.length * 2);
+      const v = new DataView(wavBuf);
+      const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o+i, s.charCodeAt(i)); };
+      ws(0,'RIFF'); v.setUint32(4, 36+pcm.length*2, true); ws(8,'WAVE');
+      ws(12,'fmt '); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+      v.setUint32(24,SAMPLE_RATE,true); v.setUint32(28,SAMPLE_RATE*2,true);
+      v.setUint16(32,2,true); v.setUint16(34,16,true); ws(36,'data');
+      v.setUint32(40, pcm.length*2, true);
+      let o = 44;
+      for (let i = 0; i < pcm.length; i++, o+=2) v.setInt16(o, pcm[i], true);
+
+      const blob = new Blob([wavBuf], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
+      setMergedAudioUrl(url);
+      showOk(`✓ TTS audio merged — ${duration.toFixed(0)}s WAV ready. Clips placed at exact subtitle timestamps.`);
+    } catch (ex) {
+      showErr(`Audio merge failed: ${ex.message}`);
+    } finally {
+      setIsMergingAudio(false);
+    }
+  };
+
+  const downloadMergedAudio = () => {
+    if (!mergedAudioUrl) return;
+    const a = document.createElement('a');
+    a.href = mergedAudioUrl;
+    a.download = (videoFile?.name.replace(/\.[^.]+$/, '') || 'tts') + '_Myanmar_TTS.wav';
+    a.click();
+  };
+
+  const downloadSrt = () => {
     if (!segments.length) { showErr('No segments to export.'); return; }
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([buildSrt(segments)], { type:'text/srt;charset=utf-8' }));
     a.download = (videoFile?.name.replace(/\.[^.]+$/, '') || 'subtitles') + '_Myanmar.srt';
-    a.click(); showOk('✓ SRT exported!');
-  };
-
-  const runRenderVideo = async () => {
-    if (!videoRef.current || !segments.length) { showErr('Need video + synced segments.'); return; }
-    if (!videoRef.current.videoWidth) { showErr('Video not ready. Wait for it to load fully.'); return; }
-    setIsRendering(true); setRenderProg(0); setOutputUrl(null);
-    try {
-      const url = await renderOutputVideo(videoRef.current, segments, p => setRenderProg(p));
-      setOutputUrl(url);
-      const mime = ['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'].find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
-      setOutputMime(mime);
-      showOk('✓ Output video rendered with Myanmar TTS audio + burned subtitles!');
-    } catch (ex) { showErr(`Render failed: ${ex.message}`); }
-    finally { setIsRendering(false); }
+    a.click(); showOk('✓ SRT file downloaded!');
   };
 
   // ── stats ────────────────────────────────────────────────────────────────
@@ -409,7 +459,7 @@ export default function App() {
               <input type="password" placeholder="Gemini API Key…" value={apiKey} onChange={e=>setApiKey(e.target.value)}
                 className="input-premium bg-slate-950 rounded-xl px-3 py-2 text-xs text-violet-300 placeholder:text-slate-700 w-44 font-mono" />
             )}
-            <button onClick={exportSrt} className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700 px-3 py-2 rounded-xl text-xs font-bold text-slate-200 transition-all hover:border-violet-400/30">
+            <button onClick={downloadSrt} className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700 px-3 py-2 rounded-xl text-xs font-bold text-slate-200 transition-all hover:border-violet-400/30">
               <Ico d={I.dl} cls="w-3.5 h-3.5" /> SRT
             </button>
           </div>
@@ -573,24 +623,100 @@ export default function App() {
                 {isSynced && <span className="ml-1 text-emerald-400">✓</span>}
               </button>
 
-              {/* ⑤ Render video */}
-              <button onClick={runRenderVideo} disabled={isRendering || !segments.length || !videoUrl}
-                className="w-full py-3 rounded-xl text-xs font-black flex items-center justify-center gap-2
-                  bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-200 border border-emerald-500/30 transition-all disabled:opacity-40">
-                {isRendering
-                  ? <><Spinner color="emerald"/>Rendering… {Math.round(renderProg*100)}%</>
-                  : <><Ico d={I.video} cls="w-3.5 h-3.5"/>⑤ Render Output Video (TTS + Subtitles)</>}
-              </button>
-              {isRendering && <PBar v={renderProg} color="emerald"/>}
+              {/* ── EXPORT HUB ── */}
+              <div className="border border-violet-500/20 rounded-2xl overflow-hidden">
+                {/* Header */}
+                <div className="bg-violet-950/30 px-4 py-2.5 border-b border-violet-500/20 flex items-center gap-2">
+                  <Ico d={I.dl} cls="w-4 h-4 text-violet-400"/>
+                  <span className="text-xs font-black text-violet-200">⑤ Export — Download All 3 Files</span>
+                </div>
+                <div className="p-3 flex flex-col gap-2">
 
-              {/* Download */}
-              {outputUrl && (
-                <a href={outputUrl} download="htut_myanmar_recap.webm"
-                  className="w-full py-3 rounded-xl text-xs font-black flex items-center justify-center gap-2
-                    bg-violet-600 hover:bg-violet-500 text-white transition-all shadow-lg shadow-violet-500/20">
-                  <Ico d={I.dl} cls="w-3.5 h-3.5"/>Download Output Video (.webm)
-                </a>
-              )}
+                  {/* File 1: SRT */}
+                  <div className="flex items-center gap-3 p-3 bg-slate-950/80 rounded-xl border border-slate-800">
+                    <div className="w-9 h-9 rounded-lg bg-blue-600/20 border border-blue-500/30 flex items-center justify-center flex-shrink-0">
+                      <span className="text-base">📄</span>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-bold text-slate-200">Myanmar Subtitles (.srt)</p>
+                      <p className="text-[10px] text-slate-500">{segments.length} segments · TTS-synced timestamps</p>
+                    </div>
+                    <button onClick={downloadSrt} disabled={!segments.length}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-black
+                        bg-blue-600/20 hover:bg-blue-600/35 text-blue-300 border border-blue-500/30 transition-all disabled:opacity-40 whitespace-nowrap">
+                      <Ico d={I.dl} cls="w-3 h-3"/> Download SRT
+                    </button>
+                  </div>
+
+                  {/* File 2: Merged TTS Audio */}
+                  <div className="flex items-center gap-3 p-3 bg-slate-950/80 rounded-xl border border-slate-800">
+                    <div className="w-9 h-9 rounded-lg bg-fuchsia-600/20 border border-fuchsia-500/30 flex items-center justify-center flex-shrink-0">
+                      <span className="text-base">🎵</span>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-bold text-slate-200">Myanmar TTS Audio (.wav)</p>
+                      <p className="text-[10px] text-slate-500">
+                        {ttsCount > 0 ? `${ttsCount} clips merged · ${duration.toFixed(0)}s · silence-padded` : 'Run Batch TTS first'}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      {!mergedAudioUrl ? (
+                        <button onClick={exportMergedTtsAudio} disabled={isMergingAudio || !ttsCount}
+                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-black
+                            bg-fuchsia-600/20 hover:bg-fuchsia-600/35 text-fuchsia-300 border border-fuchsia-500/30 transition-all disabled:opacity-40 whitespace-nowrap">
+                          {isMergingAudio ? <><Spinner color="fuchsia"/>Merging…</> : <><Ico d={I.tts} cls="w-3 h-3"/>Build WAV</>}
+                        </button>
+                      ) : (
+                        <button onClick={downloadMergedAudio}
+                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-black
+                            bg-emerald-600/20 hover:bg-emerald-600/35 text-emerald-300 border border-emerald-500/30 transition-all whitespace-nowrap">
+                          <Ico d={I.dl} cls="w-3 h-3"/>Download WAV
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* File 3: Original Video (user already has it) */}
+                  <div className="flex items-center gap-3 p-3 bg-slate-950/80 rounded-xl border border-slate-800">
+                    <div className="w-9 h-9 rounded-lg bg-emerald-600/20 border border-emerald-500/30 flex items-center justify-center flex-shrink-0">
+                      <span className="text-base">🎬</span>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-bold text-slate-200">Original Video</p>
+                      <p className="text-[10px] text-slate-500">{videoFile ? videoFile.name : 'Your uploaded file'}</p>
+                    </div>
+                    <span className="text-[10px] text-slate-600 bg-slate-800 px-2 py-1 rounded-lg">You have it ✓</span>
+                  </div>
+
+                  {/* FFmpeg merge guide */}
+                  <div className="mt-1 p-3 bg-slate-950 rounded-xl border border-amber-500/20">
+                    <p className="text-[10px] font-bold text-amber-400 mb-2 flex items-center gap-1.5">
+                      <span>⚡</span> Merge with FFmpeg (fastest, free)
+                    </p>
+                    <div className="space-y-2">
+                      <div>
+                        <p className="text-[9px] text-slate-500 mb-1">Option A — Replace audio with TTS, burn subtitles:</p>
+                        <code className="block text-[9px] font-mono text-emerald-300 bg-black/60 p-2 rounded-lg leading-relaxed break-all">
+                          ffmpeg -i original.mp4 -i Myanmar_TTS.wav -vf subtitles=Myanmar.srt -map 0:v -map 1:a -shortest output.mp4
+                        </code>
+                      </div>
+                      <div>
+                        <p className="text-[9px] text-slate-500 mb-1">Option B — Keep original audio + add TTS on top + subtitles:</p>
+                        <code className="block text-[9px] font-mono text-cyan-300 bg-black/60 p-2 rounded-lg leading-relaxed break-all">
+                          ffmpeg -i original.mp4 -i Myanmar_TTS.wav -filter_complex "[0:a]volume=0.3[a1];[1:a]volume=1.0[a2];[a1][a2]amix=inputs=2[aout]" -vf subtitles=Myanmar.srt -map 0:v -map "[aout]" output.mp4
+                        </code>
+                      </div>
+                      <div>
+                        <p className="text-[9px] text-slate-500 mb-1">Option C — Subtitles only (no audio change):</p>
+                        <code className="block text-[9px] font-mono text-violet-300 bg-black/60 p-2 rounded-lg leading-relaxed break-all">
+                          ffmpeg -i original.mp4 -vf subtitles=Myanmar.srt -c:a copy output.mp4
+                        </code>
+                      </div>
+                    </div>
+                    <p className="text-[9px] text-slate-600 mt-2">Install FFmpeg free: ffmpeg.org · Runs in seconds on any PC/Mac</p>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -615,7 +741,7 @@ export default function App() {
                     className="text-[10px] flex items-center gap-1 bg-cyan-600/15 hover:bg-cyan-600/25 text-cyan-300 border border-cyan-500/25 px-2.5 py-1.5 rounded-lg font-bold transition-all disabled:opacity-40">
                     <Ico d={I.sync} cls="w-3 h-3"/>Re-sync
                   </button>
-                  <button onClick={exportSrt}
+                  <button onClick={downloadSrt}
                     className="text-[10px] flex items-center gap-1 bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 px-2.5 py-1.5 rounded-lg font-bold transition-all">
                     <Ico d={I.dl} cls="w-3 h-3"/>SRT
                   </button>
